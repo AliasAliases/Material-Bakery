@@ -1,0 +1,374 @@
+# ##### BEGIN GPL LICENSE BLOCK #####
+#  GPL v2+ — see LICENSE.txt
+# ##### END GPL LICENSE BLOCK #####
+
+# ------------------------------------------------------------------------------------
+#   计划编译：把设置编译成一张任务清单
+#
+#   这是「设置」与「引擎」之间的唯一接口。引擎不知道什么叫烘焙列表、什么叫命名结构，
+#   它只拿到一串 BakeTask 并逐个执行。
+#
+#   BakeTask 里 targets / sources 是**两个**列表 —— 这就是给 S2A 与重拓补整合留的缝。
+#   本期 sources 恒等于 targets（每个物体用自己的材质直接烘）。
+# ------------------------------------------------------------------------------------
+
+from dataclasses import dataclass, field
+
+from . import bake_types, naming, scene_scan, udim
+
+
+@dataclass
+class MapRequest:
+    """烘焙列表里的一项"""
+    type_key: str
+    size: int
+    options: dict = field(default_factory=dict)   # 该类型的专属参数（通道打包的 R/G/B 等）
+
+    @property
+    def bake_type(self):
+        return bake_types.require(self.type_key)
+
+
+@dataclass
+class BakeTask:
+    group_name: str
+    bake_type: object                 # BakeType
+    size: int                         # 最终交付尺寸
+    image_name: str
+    targets: list = field(default_factory=list)   # 烘进这些物体的 UV
+    sources: list = field(default_factory=list)   # 从这些物体采样（本期 == targets）
+    options: dict = field(default_factory=dict)   # 节点手术要用的参数
+    render_size: int = 0              # 实际烘焙尺寸（抗锯齿时 != size）
+    tile: int = 0                     # UDIM 瓦片号；0 表示不是 UDIM
+    uv_shift: tuple = ()              # UDIM 烘焙前要施加的 UV 平移 (-列, -行)
+    bake_params: dict = field(default_factory=dict)   # provider 追加的 bake 参数
+    udim_tiles: list = field(default_factory=list)   # 兼容旧字段
+    exported_tiles: list = field(default_factory=list)   # [(瓦片号, 路径), ...]
+
+    @property
+    def projects(self):
+        """要不要走 selected-to-active（目标和源不是同一批物体）"""
+        if not self.sources:
+            return False
+        return [o.name for o in self.sources] != [o.name for o in self.targets]
+    surgery_detail: list = field(default_factory=list)
+    status: str = "pending"           # pending / baking / done / failed / skipped
+    error: str = ""
+    image: object = None
+    exported_path: str = ""
+
+    def __post_init__(self):
+        if not self.render_size:
+            self.render_size = self.size
+
+    @property
+    def key(self):
+        return "{}|{}|{}|{}".format(self.group_name, self.bake_type.key, self.size,
+                                    self.tile)
+
+
+@dataclass
+class BakeSettings:
+    """计划编译需要的全部设置 —— 纯数据，不含任何 bpy 引用
+
+    这样 core.plan 可以在无 Blender 上下文的情况下被测试。
+    """
+    target_mode: str = scene_scan.MODE_COLLECTIONS
+    single_collection: str = ""
+    maps: tuple = ()                          # (MapRequest, ...)
+    prefix: str = ""
+    bridge: str = naming.DEFAULT_BRIDGE
+    suffix: str = naming.DEFAULT_SUFFIX
+    template: str = naming.DEFAULT_TEMPLATE
+    type_names: dict = field(default_factory=dict)    # type_key -> 自定义名
+    shared_textures: bool = True              # 一组物体共用一套贴图（本项目恒为真）
+    file_format: str = 'PNG'
+    # 每个集合一个子文件夹。引擎保存时就按这个来，不是只在"导出贴图"时才分。
+    use_subfolders: bool = True
+    prepare_uv: bool = False
+    # 给"没有 UV"的物体展 UV 时，展到哪一层（'UVMap' 或 'MBAKERY_UV'）。
+    # 只影响没有 UV 的物体；已有 UV 的永远不动。
+    unwrap_target: str = "UVMap"
+    # 烘完是否把图像 pack 进 .blend。
+    # ⚠ 默认**关**（2026-09 用户要求）：图写到输出目录、材质链接到文件，
+    #   "要不要塞进 .blend"由用户自己决定（大场景几百张图塞进去文件会非常大）。
+    #   没设输出目录时图只在内存里，会明确警告。
+    #   ⚠ 链接式的图**不能**用 image.save() 再导出（像素缓冲可能已被释放、
+    #   报 "does not have any image data"）—— 导出层改成"没像素就直接拷文件"。
+    pack_into_blend: bool = False
+    fake_user: bool = True
+
+    # 抗锯齿：'OFF' 直接按 size 烘；'DOWNSCALE' 按 size×aa_scale 烘完再缩回来
+    # （超采样，真正的抗锯齿）；'UPSCALE' 按 size 烘完放大（给低清预览用）
+    antialias: str = 'OFF'
+    aa_scale: int = 2
+    bake_method: str = 'EMISSION'      # EMISSION（节点手术）/ NATIVE（原生 pass）
+    # 自适应边距：贴图越大，UV 岛之间的缝隙按比例放大，免得高分辨率下漏底色
+    adaptive_margin: bool = False
+    margin: int = 16
+    # UDIM：跨多张瓦片的物体，一张 TILED 图一次烘完，导出时按瓦片分文件
+    udim: bool = False
+
+    # Selected to Active（投影烘焙）—— 重拓补工作流的接口
+    selected_to_active: bool = False
+    source_mode: str = 'OTHERS'        # OTHERS / PATTERN / SELECTED
+    source_pattern: str = ""
+    # ⚠ 只有 max_ray_distance 是 Blender 真接受的参数名（4.x 的 object.bake）。
+    #   曾经用过 ray_distance —— 那个名字不存在，会被静默丢掉。
+    max_ray_distance: float = 0.0
+    cage_extrusion: float = 0.0
+    unhide_sources: bool = True
+
+    # 只把本次要烘的物体留在渲染里，其余网格在运行期间藏起来
+    # （Cycles 就不必为其它 31 个集合建几何 / 加载贴图）。
+    # ⚠ 默认**关**：藏起来的物体会从 AO / 阴影 / 光路类通道里消失，
+    #   那些通道的语义就变了（见 ui/ops.py 的 sample_rows 警告）。
+    hide_unrelated: bool = False
+
+    def type_label(self, type_key):
+        """类型在文件名里的 token：优先用自定义名，去掉所有空白"""
+        custom = self.type_names.get(type_key)
+        label = custom if custom else bake_types.require(type_key).label
+        return naming.type_token(label)
+
+
+@dataclass
+class BakePlan:
+    groups: list = field(default_factory=list)        # [ObjectGroup, ...]
+    tasks: list = field(default_factory=list)         # [BakeTask, ...]
+    conflicts: list = field(default_factory=list)
+    skipped: list = field(default_factory=list)       # [(组名, 原因), ...]
+    warnings: list = field(default_factory=list)
+    name_preview: list = field(default_factory=list)  # [(组名, 文件名), ...]
+    # 从磁盘救回来的那次没有任务记录（图是现成的），交付时把组里的物体直接当"成功"
+    assume_all_succeeded: bool = False
+
+    @property
+    def is_empty(self):
+        return not self.tasks
+
+    def counts(self):
+        total = len(self.tasks)
+        done = sum(1 for t in self.tasks if t.status == "done")
+        failed = sum(1 for t in self.tasks if t.status == "failed")
+        return total, done, failed
+
+    def object_all_succeeded(self, obj):
+        """这个物体的所有任务都成功了吗 —— 材质槽交付的前提条件"""
+        if self.assume_all_succeeded:
+            # 从磁盘救回来的那次没有"任务"可查：图是现成的，物体直接可交付。
+            return any(obj in group.objects for group in self.groups)
+        related = [t for t in self.tasks if obj in t.targets]
+        if not related:
+            return False
+        return all(t.status == "done" for t in related)
+
+
+def render_size(size, settings):
+    """实际烘焙尺寸。
+
+    'DOWNSCALE' 是超采样：按 size×N 烘，后面再缩回 size，边缘会明显更干净。
+    贴图最贵的就是这一步，所以默认是 OFF，由用户自己开。
+    """
+    scale = max(1, int(getattr(settings, "aa_scale", 2) or 1))
+    mode = getattr(settings, "antialias", 'OFF')
+    if mode == 'DOWNSCALE':
+        return int(size) * scale
+    return int(size)
+
+
+def effective_margin(size, settings):
+    """边距。开了自适应就按分辨率放大 —— 4K 图用 16px 边距会漏底色。"""
+    base = int(getattr(settings, "margin", 16) or 0)
+    if not getattr(settings, "adaptive_margin", False):
+        return base
+    return max(base, min(64, int(round(int(size) * 0.008))))
+
+
+# 实测常数：真机 Cycles 烘焙一张 2048² 大约占 71.6 MB 常驻内存
+# （test.blend，3 物体 × 3 贴图，1024/2048 两轮对比得到斜率 17.9 字节/像素，
+#  见 tools/measure_bake_memory.py）。这里面既有像素缓冲区，也有 Cycles
+#  自己的常驻开销，所以不能只按 w*h*4*channels 算 —— 那样会低估一大截。
+MEASURED_BYTES_PER_PIXEL = 18.0
+
+
+def estimate_memory_mb(tasks):
+    """按**实测**斜率估算这一轮烘焙大概要吃多少内存（MB）。
+
+    为什么不是 w*h*4：一个 2048² 的浮点图名义上 64 MB，但真烘一轮下来
+    每张的实际成本约 71.6 MB（含 Cycles 开销）；而 1024² 的实测成本是
+    44.7 MB，名义值只有 16 MB —— 说明固定开销占大头，按名义值算会严重低估。
+    """
+    total = 0.0
+    for task in tasks:
+        size = int(getattr(task, "render_size", 0) or getattr(task, "size", 0) or 0)
+        total += size * size * MEASURED_BYTES_PER_PIXEL
+    return total / (1024.0 * 1024.0)
+
+
+def memory_warning(tasks, threshold_mb=2048.0):
+    """内存估算超过阈值时给一句人话；否则返回空串。"""
+    estimate = estimate_memory_mb(tasks)
+    if estimate < threshold_mb:
+        return ""
+    return ("{} maps at this resolution will need roughly {:.1f} GB of memory "
+            "while baking. Lower the resolution or bake in smaller batches "
+            "if Blender runs out.".format(len(tasks), estimate / 1024.0))
+
+
+def build_plan(context, settings, gate_lookup=None, provider=None):
+    """把设置编译成计划。不创建任何图像，也不改场景。
+
+    provider: engine.providers.BakeProvider。给了就用它决定目标和**采样源**
+              （重拓补整合的接入点）；不给就用 core.scene_scan 的默认行为。
+    """
+    plan = BakePlan()
+
+    if provider is not None:
+        groups, conflicts = provider.resolve_targets(context, settings, gate_lookup)
+    else:
+        groups, conflicts = scene_scan.resolve_targets(
+            context, settings.target_mode, settings.single_collection, gate_lookup)
+    plan.conflicts = conflicts
+
+    for group in groups:
+        if group.skipped:
+            plan.skipped.append((group.name, group.reason))
+
+    usable = [g for g in groups if not g.skipped and g.objects]
+
+    # 没有材质的物体：**只警告，不剔除**（用户 2026-09 明确要求先跳过这一步）。
+    #
+    # ⚠ 这里是有代价的，必须说清楚：
+    #   Blender 的烘焙要求每个被选中的物体都有材质，否则整批报
+    #   "No active image found, add a material or bake to an external file"，
+    #   而且不说哪个物体（实测见 tools/probe_no_active_image.py）。
+    #   所以下面这条警告不是"提示一下"，它是在预告**这一组会整批失败**。
+    #   曾经实现过"计划阶段剔掉这些物体"，用户要求先不要动"哪些物体参与烘焙"，
+    #   于是保留行为不变、把话说在前面（第 3 页清单里也有一条黄色提醒）。
+    #   想启用剔除：把这行换成 scene_scan.drop_objects_without_material(group)。
+    for group in usable:
+        naked = scene_scan.objects_without_material(group.objects)
+        if naked:
+            plan.warnings.append(
+                "'{}': {} object(s) have NO material — Blender will refuse this whole "
+                "collection (\"No active image found\"). Give them a material, or turn "
+                "the collection off: {}".format(
+                    group.name, len(naked), ", ".join(o.name for o in naked[:5])))
+
+    # 缺 UV 的物体：默认不展，直接剔除并记账
+    if not settings.prepare_uv:
+        for group in usable:
+            dropped = scene_scan.drop_objects_without_uv(group)
+            if dropped:
+                plan.warnings.append(
+                    "'{}': skipped {} object(s) with no UV map.".format(group.name, dropped))
+        still_usable = []
+        for group in usable:
+            if not group.objects:
+                group.skipped = True
+                group.reason = "No object has a UV map"
+                plan.skipped.append((group.name, group.reason))
+                continue
+            still_usable.append(group)
+        usable = still_usable
+
+    plan.groups = usable
+
+    if not usable:
+        return plan
+    if not settings.maps:
+        return plan
+
+    # 前缀决策：用户填了就用用户的，没填就用集合名（没有集合则用物体名）。
+    # auto_mode == "没填前缀" —— select_prefix 里这就是走自动命名的分支。
+    auto_mode = not settings.prefix
+
+    def prefix_for(group):
+        object_name = group.objects[0].name if group.objects else group.name
+        return naming.select_prefix(settings.prefix, group.name, object_name, auto_mode)
+
+    # 撞名消解：同一批里解析出同一前缀的组，补物体名
+    collide = {}
+    for group in usable:
+        collide.setdefault(prefix_for(group), []).append(group.name)
+    for base, names in collide.items():
+        if len(names) > 1:
+            plan.warnings.append(
+                "{} groups resolve to the same prefix '{}'; object names will be appended.".format(
+                    len(names), base))
+
+    for group in usable:
+        object_name = group.objects[0].name if group.objects else group.name
+        prefix = prefix_for(group)
+        if len(collide.get(prefix, [])) > 1:
+            prefix = naming.disambiguate(prefix, object_name)
+
+        # UDIM：跨多张瓦片的组，**每张瓦片一个任务**，各自烘进一张平铺图。
+        # 烘之前会把 UV 临时平移，让目标瓦片落到 0..1（见 engine/uv_prep.py）。
+        tiles = []
+        if settings.udim:
+            tiles = udim.group_tiles(group.objects)
+            if len(tiles) < 2:
+                tiles = []
+        template = naming.DEFAULT_TEMPLATE_UDIM if tiles else settings.template
+        tile_list = tiles or [0]
+
+        # 采样源 —— 默认就是目标自己；provider 给出别的物体就变成投影烘焙
+        sources = list(group.objects)
+        if provider is not None:
+            resolved = provider.resolve_sources(group, settings, context)
+            if resolved:
+                sources = list(resolved)
+
+        for request in settings.maps:
+            bake_type = request.bake_type
+            base_name = naming.render_name(template, {
+                "prefix": prefix,
+                "type": settings.type_label(bake_type.key),
+                "bridge": settings.bridge,
+                "size": naming.size_token(request.size),
+                "suffix": settings.suffix,
+            })
+            for tile in tile_list:
+                # UDIM 的文件名就是"基础名.瓦片号"，和业界习惯一致
+                image_name = "{}.{}".format(base_name, tile) if tile else base_name
+                task = BakeTask(
+                    group_name=group.name,
+                    bake_type=bake_type,
+                    size=request.size,
+                    render_size=render_size(request.size, settings),
+                    image_name=image_name,
+                    targets=list(group.objects),
+                    sources=list(sources),          # ← 投影烘焙时这里是高模
+                    options=dict(request.options or {}),
+                    tile=tile,
+                    uv_shift=udim.tile_uv_shift(tile),
+                )
+                if provider is not None:
+                    task.bake_params = dict(provider.extra_bake_params(task) or {})
+                plan.tasks.append(task)
+                if len(plan.name_preview) < 12:
+                    plan.name_preview.append((group.name, image_name))
+
+    return plan
+
+
+def map_requests_from_pairs(pairs):
+    """[(type_key, size), ...] -> (MapRequest, ...)，顺带去重
+
+    也接受 (type_key, size, options) 三元组。
+    """
+    seen = set()
+    requests = []
+    for entry in pairs:
+        type_key, size = entry[0], entry[1]
+        options = entry[2] if len(entry) > 2 else {}
+        key = (type_key, int(size))
+        if key in seen:
+            continue
+        seen.add(key)
+        bake_types.require(type_key)          # 不认识的 key 直接抛错，别静默跳过
+        requests.append(MapRequest(type_key=type_key, size=int(size),
+                                  options=dict(options or {})))
+    return tuple(requests)
