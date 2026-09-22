@@ -1,0 +1,25 @@
+# Build output / scratch
+_probe/
+__pycache__/
+*.pyc
+*.blend1
+tools/probe_run_prefs.txt
+*_install.zip
+MaterialBakery-*.zip
+*-v[0-9]*.zip
+
+# Third-party binaries are never vendored here: QuadRemesher is a commercial
+# product of Exoside and is not distributed with this repository. The rule is
+# kept as a guard for anyone who drops a local copy in for packaging.
+#
+# NOTE: this used to be silent-broken. A PowerShell rewrite of this file merged
+# the rule into the comment line above it, so git never read it and 105 vendor
+# files were committed by `git add -A`. Verifying an ignore rule means running
+# `git check-ignore -v <path>`, not grepping this file for the path.
+MaterialBakery/QuadRemesher/
+
+# Secrets: never commit a token.
+*.token
+.gh-token*
+*Token*.txt
+*token*.txt
