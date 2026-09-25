@@ -6,9 +6,22 @@ uses OpenSSL -- the same backend git uses successfully. curl.exe is NOT usable
 here: it goes through schannel and the sandbox blocks it
 (`schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS`).
 
+Release asset naming rule (user, 2026-09-25: "私有库就叫
+MaterialBakery-QuadRemesher-<tag>.zip，公有库就叫 material_bakery_install.zip"):
+
+    private repo : MaterialBakery-QuadRemesher-<tag>.zip   <- version stamped
+    public  repo : material_bakery_install.zip             <- stable name
+    both repos   : quadremesher_install.zip   (the 40 MB QR payload)
+
+So you only ever pass a TAG; the names are derived. Hard-coding them by hand is
+exactly how the private release ended up with a stale alias next to a fresh
+build (the alias said build 2026-09-23 while the canonical name said 2026-09-25).
+
 Usage:
-    python tools/gh_upload_assets.py --dry-run
-    python tools/gh_upload_assets.py
+    python tools/gh_upload_assets.py --tag v1.1 --dry-run
+    python tools/gh_upload_assets.py --tag v1.1
+    python tools/gh_upload_assets.py --tag v1.1 --extra-alias   # also keep the
+        canonical material_bakery_install.zip on the private release
 """
 
 import argparse
@@ -27,15 +40,23 @@ API = "https://api.github.com"
 PRIVATE = "AliasAliases/Material-Bakery-QuadRemesher"
 PUBLIC = "AliasAliases/Material-Bakery"
 
-# (repo, asset file name on disk, asset name in the release, tag)
-WANTED = [
-    (PRIVATE, os.path.join(WS, "MaterialBakery", "material_bakery_install.zip"),
-     "material_bakery_install.zip", "v1.1"),
-    (PRIVATE, os.path.join(WS, "MaterialBakery", "QuadRemesher_install.zip"),
-     "quadremesher_install.zip", "v1.1"),
-    (PUBLIC, os.path.join(WS, "MaterialBakery", "material_bakery_install.zip"),
-     "material_bakery_install.zip", "v1.1"),
-]
+INSTALL_ZIP = os.path.join(WS, "MaterialBakery", "material_bakery_install.zip")
+QR_ZIP = os.path.join(WS, "MaterialBakery", "quadremesher_install.zip")
+
+
+def wanted(tag, extra_alias=False):
+    """[(repo, local path, asset name)] for this tag."""
+    rows = [
+        (PRIVATE, INSTALL_ZIP, "MaterialBakery-QuadRemesher-{}.zip".format(tag)),
+        (PUBLIC, INSTALL_ZIP, "material_bakery_install.zip"),
+    ]
+    if os.path.exists(QR_ZIP):
+        rows.append((PRIVATE, QR_ZIP, "quadremesher_install.zip"))
+    if extra_alias:
+        # The alias started life as a rename of the install zip, so keeping both
+        # on the same release means two download links with identical bytes.
+        rows.append((PRIVATE, INSTALL_ZIP, "material_bakery_install.zip"))
+    return rows
 
 
 def token():
@@ -85,32 +106,41 @@ def upload(repo, release_id, path, name, auth):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--tag", default="v1.1",
+                        help="release tag to update (asset names are derived from it)")
+    parser.add_argument("--extra-alias", action="store_true",
+                        help="also upload material_bakery_install.zip on the "
+                             "private release (same bytes as the versioned name)")
     args = parser.parse_args()
 
     auth = token()
     print("token: {}... ({} chars)".format(auth[:4], len(auth)))
+    print("tag: {}".format(args.tag))
+    for _repo, _path, name in wanted(args.tag, args.extra_alias):
+        print("  will ensure: {}  <- {}".format(name, os.path.basename(_path)))
 
     cache = {}
-    for repo, path, name, tag in WANTED:
+    for repo, path, name in wanted(args.tag, args.extra_alias):
         # ⚠ 每个仓库的 releases 只查一次。第一版把 releases() 调用写在循环体里，
         #   同一个仓库被查了三遍 —— 多打的请求既慢又容易撞上速率限制。
         if repo not in cache:
             cache[repo] = releases(repo, auth)
-        rel = next((item for item in cache[repo] if item.get("tag_name") == tag), None)
+        rel = next((item for item in cache[repo]
+                    if item.get("tag_name") == args.tag), None)
         if rel is None:
             print("{}: no release with tag {} -- existing tags: {}".format(
-                repo, tag, [item.get("tag_name") for item in cache[repo]]))
+                repo, args.tag, [item.get("tag_name") for item in cache[repo]]))
             continue
         existing = {asset["name"]: asset for asset in rel.get("assets", [])}
         print("{} release {} (id={}): assets = {}".format(
-            repo, tag, rel["id"], sorted(existing) or "none"))
+            repo, args.tag, rel["id"], sorted(existing) or "none"))
         if not os.path.exists(path):
             print("  missing on disk: {}".format(path))
             continue
         old = existing.get(name)
         if old is not None:
-            print("  asset {} already exists (id={}); deleting it first".format(
-                name, old["id"]))
+            print("  asset {} already exists ({} bytes, id={}); deleting it first".format(
+                name, old.get("size"), old["id"]))
             if not args.dry_run:
                 status, payload = call(
                     "DELETE",

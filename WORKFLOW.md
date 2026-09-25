@@ -99,15 +99,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_all_tests.ps1  # �
 ```python
 # material_bakery/__init__.py
 bl_info = {"version": (1, 1, 0), ...}
-__build__ = "2026-09-23 02:25"     # 每次打包都改
+__build__ = "2026-09-25 08:40"     # 每次打包都改
 ```
 第 1 页顶部显示 `v1.1.0 · build …`。这不是装饰：**装 zip 不会替换内存里已加载的模块**，
 用户不重启就会以为"改了没用"—— 这个坑浪费过一整轮排查。
 
 ### ⑦⑧ 交付
-- 私有完整版：`material_bakery_install.zip`（38 模块）+ `quadremesher_install.zip`
+- 私有完整版：`MaterialBakery-QuadRemesher-v1.1.zip`（38 模块）+ `quadremesher_install.zip`
 - 公开版：`material_bakery_install.zip`（36 模块，无 Remesh 页）
 - 告诉用户：装哪个文件、**装完完全退出 Blender 再启动**、第 1 页应显示哪个版本号。
+- **Release 附件的命名规则**（用户 2026-09-25 定："私有库就叫
+  MaterialBakery-QuadRemesher-v1.1.zip，公有库就叫 material_bakery_install.zip"）：
+
+  | 仓库 | 附件名 |
+  |---|---|
+  | 私有 | `MaterialBakery-QuadRemesher-<tag>.zip`、`quadremesher_install.zip` |
+  | 公开 | `material_bakery_install.zip` |
+
+  ```powershell
+  python tools\gh_upload_assets.py --tag v1.1     # 名字由 tag 推导，别手写
+  ```
+  > ⚠ 以前名字是手写的，于是私有库出现过"版本别名还是旧包、规范名是新包"的分叉 ——
+  > 谁点那个带版本号的名字，下到的就是没有修复的旧构建。现在只传 tag。
+
 
 ---
 
@@ -194,7 +208,7 @@ git checkout main                                       # 回到完整版
 | 版本 | v1.1（tag + Release） | v1.1（tag + Release） |
 | 历史 | 初始提交 + 本轮修复提交 | 初始提交 + 本轮修复提交 |
 | 文件 | 132（0 厂商文件 / 0 zip / 0 密钥） | 115（同上） |
-| Release 附件 | `MaterialBakery-QuadRemesher-v1.1.zip`（别名）、`quadremesher_install.zip`、`material_bakery_install.zip` | `material_bakery_install.zip` |
+| Release 附件 | `MaterialBakery-QuadRemesher-v1.1.zip`、`quadremesher_install.zip`（+ 规范名 `material_bakery_install.zip`） | `material_bakery_install.zip` |
 | 测试 | 20 套 / 1303 项 / ~31 秒 | 17 套 / 1186 项 / ~26 秒 |
 
 本地：`main` = 完整版（工作树就是它），`public` 分支 = 公开版来源；`v1.0` 的 Release 保留。
