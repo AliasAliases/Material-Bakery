@@ -256,7 +256,7 @@ Targets & Maps  →  Settings  →  Bake  →  Result
 
 ## 验证情况
 
-- 全量回归 **18 套 / 1247 项检查，0 失败、0 跳过**
+- 全量回归 **17 套 / 1186 项检查，0 失败、0 跳过**
   —— 一条命令跑完：`powershell -NoProfile -ExecutionPolicy Bypass -File tools\run_all_tests.ps1`
   （跑得不顺的套件可以自己声明 `SKIPPED (原因)`：那不是失败，但会在汇总里单独列出来，
   免得"引擎不在"这种跳过被当成绿灯。）
