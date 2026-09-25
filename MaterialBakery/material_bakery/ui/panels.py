@@ -365,7 +365,9 @@ class MBAKERY_PT_Wizard(bpy.types.Panel):
                 self.draw_type_options(options, current, bake_type)
 
         preview_box = _box(layout, "Name Preview", 'SORTALPHA')
-        groups, _conflicts = scene_scan.scan(context.scene)
+        # ⚠ 带视图层：预览里不能出现"选都选不中"的集合，否则用户看到的命名
+        #   与实际会烘的那批对不上（见 core/scene_scan.NO_VIEW_LAYER）。
+        groups, _conflicts = scene_scan.scan(context.scene, context.view_layer)
         shown = 0
         for group in groups:
             if not group.objects or shown >= 5:
@@ -536,7 +538,7 @@ class MBAKERY_PT_Wizard(bpy.types.Panel):
         tiles.prop(settings, "udim")
         if settings.udim:
             from ..core import udim as udim_mod
-            groups, _conflicts = scene_scan.scan(context.scene)
+            groups, _conflicts = scene_scan.scan(context.scene, context.view_layer)
             found = 0
             for group in groups:
                 group_tiles = udim_mod.group_tiles(group.objects)

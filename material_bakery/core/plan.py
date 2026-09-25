@@ -288,6 +288,29 @@ def build_plan(context, settings, gate_lookup=None, provider=None):
 
     usable = [g for g in groups if not g.skipped and g.objects]
 
+    # 不在视图层里的物体：`scene_scan.scan()` 已经把它们挡在 `group.objects` 外面了
+    # （见那里的 NO_VIEW_LAYER）。这里只把**部分被挡**的组说清楚 ——
+    # 整组被挡的已经以"skipped + 原因"的形式进了计划，不用再说两遍。
+    #
+    # ⚠ 老实说：按 `scan()` 现在的形状，这段**基本到不了** —— 一个物体的集合被
+    #   排除了，同组的其他物体必然也在同一个集合里，于是整组一起空掉、走的是
+    #   skipped 那条路（已由 tests/mb_test_view_layer.py 钉住）。留着是因为条件
+    #   本身是对的，哪天 scan 允许混合来源（比如以后支持物体级目标）它就该说话。
+    #
+    #   这份警告的定位是给用户的**行动指令**，不是统计：被排除的集合在 Outliner 里
+    #   是灰的，用户很可能根本没意识到自己把整个集合关掉了，而这一关就是整批图全废
+    #   （2026-09-25 实测：96 张里 92 张）。
+    for group in usable:
+        missing = [name for name, reason in group.excluded
+                   if reason == scene_scan.NO_VIEW_LAYER]
+        if missing:
+            plan.warnings.append(
+                "'{}': skipped {} object(s) that are NOT in the current view layer "
+                "(their collection is excluded). Blender cannot select them, so baking "
+                "them would fail with \"can't be selected because it is not in View "
+                "Layer\". Tick that collection in the Outliner, then bake again: "
+                "{}".format(group.name, len(missing), ", ".join(missing[:5])))
+
     # 没有材质的物体：**只警告，不剔除**（用户 2026-09 明确要求先跳过这一步）。
     #
     # ⚠ 这里是有代价的，必须说清楚：

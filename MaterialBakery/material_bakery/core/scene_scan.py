@@ -61,14 +61,81 @@ def iter_collections(collection, depth=0):
         yield from iter_collections(child, depth + 1)
 
 
-def scan(scene):
+# ⚠ 集合被排除（Exclude）时，它里面的物体**不在视图层里**，而烘焙操作符只认
+#   视图层的选中物体 —— `select_set` 会直接抛
+#       RuntimeError: Object 'X' can't be selected because it is not in View Layer
+#   一个都选不中时 Blender 转头去烘**当时选中的别的物体**，于是失败得更隐蔽。
+#
+#   用户 2026-09-25 的实测：他的道具文件里几乎每个集合都是排除状态（视图层里只剩
+#   2 个物体），而 `scan()` 走的是 collection.objects，完全不看视图层 ——
+#   结果 96 张图里 **92 张全废**，每一张都是同一句 "can't be selected"。
+#
+#   所以：视图层里没有的物体，既不进计划也不要派发，理由写在组的 excluded 里 ——
+#   像"No visible mesh"那样在处理之前就说清楚，而不是烘到一半才一个个报错。
+NO_VIEW_LAYER = "not in this view layer"
+
+
+def objects_in_view_layer(view_layer):
+    """这个视图层里**真的能被选中**的物体名集合。
+
+    ⚠ 判据是 layer collection 树上的 `exclude`，**不是** `view_layer.objects`。
+      两个都试过，`view_layer.objects` 是错的：那份集合要等依赖图同步之后才更新，
+      而计划编译往往就发生在"刚建完集合、还没同步"的那一刻 ——
+      于是新建出来的物体全被判成"不在视图层里"，测试里七个套件因此一起变红
+      （2026-09-25 实测）。`exclude` 是用户自己在 Outliner 里勾的那个勾，读它永远最新。
+
+    ⚠ 递归整棵树，而不是只看自己那一层：一个集合自己没被排除，但**父级**被排除了，
+      它的物体同样选不中 —— 只看自己会漏掉嵌套集合里的大批物体。
+      用户那份道具文件正是这个形状：Barricade 可见，它下面 18 个子集合全被排除。
+
+    ⚠ 用"只要出现一次被排除就算被排除"（`exclude` 取或），**不能**直接
+      `states[collection] = exclude`：同一个 collection 在一棵 layer collection
+      树里**可以出现多次**（同一个集合挂在多个父级下），后写的那次会把前面的
+      排除状态冲掉 —— 实测就是这样，修好之后计划里还有 96 个任务。
+    """
+    excluded_names = set()
+    seen = set()
+    root = getattr(view_layer, "layer_collection", None)
+    stack = [root] if root is not None else []
+    while stack:
+        layer_collection = stack.pop()
+        collection = layer_collection.collection
+        seen.add(collection)
+        if bool(layer_collection.exclude):
+            excluded_names.add(collection.name)
+        stack.extend(layer_collection.children)
+
+    scene = getattr(view_layer, "id_data", None)
+    master = getattr(scene, "collection", None)
+    names = set()
+    for collection in seen:
+        # 主集合永远不是"被排除的集合"
+        if collection is not master and collection.name in excluded_names:
+            continue
+        for obj in collection.objects:
+            names.add(obj.name)
+    return names
+
+
+def scan(scene, view_layer=None):
     """扫描整个场景。
 
     返回 (groups, conflicts)
       groups    : [ObjectGroup, ...]，含被标记跳过的
       conflicts : [(物体名, [集合名, ...]), ...] 只统计非主集合的直接链接
+
+    view_layer: 用来判断物体能不能被烘焙选中（见 NO_VIEW_LAYER）。
+                不给就**不做视图层过滤**，只按可见性筛 ——
+                "没有视图层"和"视图层里没有"是两件事，不能混为一谈。
+
+    ⚠ 不要再写 `scene.view_layers.active` 当兜底：Blender 的 view_layers 集合上
+      **没有** `active` 属性（实测 AttributeError），于是兜底永远拿到 None、
+      于是所有物体都被判成"不在视图层里" —— 三个套件因此变红，而且失败信息
+      只说"主集合里的物体没分到组"，看不出真正的原因。UI 那边走
+      `resolve_targets(context, ...)`，视图层是显式传进来的。
     """
     master = scene.collection
+    in_layer = objects_in_view_layer(view_layer) if view_layer is not None else None
     groups = []
     by_collection = {}
 
@@ -77,17 +144,22 @@ def scan(scene):
             continue
         group = ObjectGroup(name=collection.name, collection=collection)
         for obj in collection.objects:
-            if is_bakeable(obj):
-                group.objects.append(obj)
-            else:
+            if not is_bakeable(obj):
                 group.excluded.append(
                     (obj.name, "not a mesh" if obj.type != 'MESH' else "hidden"))
+            elif in_layer is not None and obj.name not in in_layer:
+                group.excluded.append((obj.name, NO_VIEW_LAYER))
+            else:
+                group.objects.append(obj)
         if not collection.objects:
             group.skipped = True
             group.reason = "No direct objects" if collection.children else "Empty collection"
         elif not group.objects:
             group.skipped = True
-            group.reason = "No visible mesh"
+            # 排除状态**要说出来**：用户看到"No visible mesh"会去检查物体是不是被
+            # H 藏了，而真正的原因是他把整个集合的勾去掉了。
+            group.reason = ("No visible mesh in this view layer — its objects are in "
+                            "excluded collections") if group.excluded else "No visible mesh"
         groups.append(group)
         by_collection[collection] = group
 
@@ -96,9 +168,12 @@ def scan(scene):
     for obj in master.objects:
         if not is_bakeable(obj):
             continue
+        if in_layer is not None and obj.name not in in_layer:
+            continue
         group = ObjectGroup(name=obj.name, collection=master)
         group.objects.append(obj)
         groups.append(group)
+
 
     # 冲突 = 同一个物体出现在不止一个分组里（跨集合共用，或者既在主集合又在子集合）
     conflicts = []
@@ -117,10 +192,18 @@ def scan_selected(context):
     """SELECTED 模式：每个选中物体自成一组（组名 = 物体名）
 
     组名就是贴图名前缀的来源 —— 没有集合时自然回落到物体名。
+
+    ⚠ 选中列表本来就来自视图层，所以这里的过滤通常一个都不会命中；
+      留着是因为代价为零，而"计划里出现一个选不中的物体"整批烘焙都会失败
+      （见 NO_VIEW_LAYER）—— 多一道闸门比多一次事故便宜。
     """
+    view_layer = getattr(context, "view_layer", None)
+    in_layer = objects_in_view_layer(view_layer) if view_layer is not None else None
     groups = []
     for obj in context.selected_objects:
         if not is_bakeable(obj):
+            continue
+        if in_layer is not None and obj.name not in in_layer:
             continue
         group = ObjectGroup(name=obj.name)
         group.objects.append(obj)
@@ -141,7 +224,9 @@ def resolve_targets(context, mode, single_collection=None, gate_lookup=None):
     if mode == MODE_SELECTED:
         return scan_selected(context), []
 
-    groups, conflicts = scan(scene)
+    # ⚠ 传 context 的视图层，不是 scene.view_layers.active：烘焙操作符认的是
+    #   **当前窗口**那个视图层，两者在多视图层的文件里可以不是同一个。
+    groups, conflicts = scan(scene, getattr(context, "view_layer", None))
 
     if mode == MODE_SINGLE:
         wanted = single_collection if single_collection is not None else ""

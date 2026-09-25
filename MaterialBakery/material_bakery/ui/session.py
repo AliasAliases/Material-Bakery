@@ -1228,7 +1228,10 @@ def refresh_groups(context, settings, measure_overlap=False):
     from . import properties
 
     previously = {item.name: item.enabled for item in settings.groups}
-    groups, conflicts = scene_scan.scan(context.scene)
+    # ⚠ 带视图层：第一页那张集合表列的必须是**能烘的**那批。不然用户会看到
+    #   一个集合写着"2 个物体"，烘起来却一张都出不来 —— 因为它的集合被排除了
+    #   （见 core/scene_scan.NO_VIEW_LAYER）。
+    groups, conflicts = scene_scan.scan(context.scene, context.view_layer)
     conflicted = {name for name, _ in conflicts}
 
     settings.groups.clear()
