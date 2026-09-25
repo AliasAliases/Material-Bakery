@@ -16,15 +16,23 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $ws = Split-Path -Parent $PSScriptRoot
 if (-not $ws) { $ws = (Get-Location).Path }
+# NOTE: Zip = the file name the zip actually gets. It is NOT always "<Name>_install.zip":
+# tests\mb_test_zip_install.py and the GitHub Release assets both use the LOWERCASE
+# quadremesher_install.zip, while the folder is QuadRemesher -- so deriving it from
+# $Name produced QuadRemesher_install.zip and the suite failed on a missing file
+# (hit 2026-09-25: the suite went red right after a cleanup deleted that file).
 $packages = @(
-    @{ Name = "material_bakery"; Source = Join-Path $ws "MaterialBakery\material_bakery" }
+    @{ Name = "material_bakery"; Zip = "material_bakery_install.zip";
+       Source = Join-Path $ws "MaterialBakery\material_bakery" },
+    @{ Name = "QuadRemesher";    Zip = "quadremesher_install.zip";
+       Source = Join-Path $ws "MaterialBakery\QuadRemesher" }
 )
 
 function New-PackageZip {
-    param([string]$Name, [string]$Source)
+    param([string]$Name, [string]$Zip, [string]$Source)
 
     if (-not (Test-Path $Source)) { throw "source not found: $Source" }
-    $zipPath = Join-Path $ws ("MaterialBakery\{0}_install.zip" -f $Name)
+    $zipPath = Join-Path $ws ("MaterialBakery\{0}" -f $Zip)
     if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
     $sourceFull = (Resolve-Path $Source).Path.TrimEnd('\')
@@ -66,12 +74,12 @@ function New-PackageZip {
 }
 
 foreach ($package in $packages) {
-    New-PackageZip -Name $package.Name -Source $package.Source
+    New-PackageZip -Name $package.Name -Zip $package.Zip -Source $package.Source
 }
 
 # Self-check: entry names must use forward slashes and live under the plugin root.
 foreach ($package in $packages) {
-    $zipPath = Join-Path $ws ("MaterialBakery\{0}_install.zip" -f $package.Name)
+    $zipPath = Join-Path $ws ("MaterialBakery\{0}" -f $package.Zip)
     $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
     try {
         $names = @($archive.Entries | ForEach-Object { $_.FullName })
