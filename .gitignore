@@ -1,0 +1,36 @@
+# Build output / scratch
+_probe/
+__pycache__/
+*.pyc
+*.blend1
+*_install.zip
+MaterialBakery-*.zip
+*-v[0-9]*.zip
+
+# Third-party binaries are never vendored here: QuadRemesher is a commercial
+# product of Exoside and is not distributed with this repository. The rule is
+# kept as a guard for anyone who drops a local copy in for packaging.
+Material-Bakery-Dev-Env/QuadRemesher/
+
+# Secrets: never commit a token -- the private tree keeps it in a file called
+# "DeepSeek ... Token.txt", and the orphan rebuild runs `git add -A` AFTER this
+# .gitignore is rewritten, so the pattern has to be here too.
+#
+# ⚠ 这条是**血的教训**（实施轮 1.6）：公开版原来的 .gitignore 只有 `*.token` /
+#   `.gh-token*`，没有 `DeepSeek*.txt` —— 于是重建公开分支时 `git add -A` 把
+#   `DeepSeek Harness Git Token.txt` **加进了公开提交**，GitHub 的密钥保护在推送时
+#   直接拒了整个 ref（GH013）。私有库的 .gitignore 有这条，公开版也必须照抄。
+DeepSeek*.txt
+*.token
+.gh-token*
+
+# 真机素材：只把测试夹具 test.blend 带进版本库，其余（几十 MB 的 .blend）忽略。
+# ⚠ 同理：少了这两行，`git add -A` 会把 `square_bush.blend`（56 MB）加进去 ——
+#   实施轮 1.6 同一次事故里一起被抓出来了。
+_samples/*
+!_samples/test.blend
+
+# 记忆库（SQLite + 会话日志）：这台机器的私有状态，任何仓库都不该有。
+# ⚠ 同一次事故：公开提交里混进了 `.dsh-meow/memory.db` 等三个文件，推上去之后
+#   才发现，只能再 force push 一次换掉那个提交。
+.dsh-meow/
